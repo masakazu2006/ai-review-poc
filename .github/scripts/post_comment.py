@@ -90,6 +90,26 @@ def find_comment(repository: str, number: int) -> int | None:
         page += 1
 
 
+def update_ledger(repository: str, state: dict) -> None:
+    """予約記録コメントに結果を追記する（再実行で実行履歴Artifactが消えても結果が残るように）。
+
+    失敗しても job の結果は変えない（予約記録そのものは投稿済みで、回数管理には影響しない）。
+    """
+    cid, base = state.get("ledger_comment_id"), state.get("ledger_body")
+    if not cid or not base:
+        return
+    u = state.get("usage") or {}
+    result = (f"<sub>結果：**{state.get('status')}**　判定 {state.get('verdict', '-')}　"
+              f"トークン 入力 {u.get('input', '-')} / 出力 {u.get('output', '-')} / 思考 {u.get('thoughts', '-')}　"
+              f"所要 {state.get('duration_sec', '-')} 秒　HTTP {state.get('http_status', '-')}</sub>")
+    try:
+        c.gh_send_json("PATCH", f"/repos/{repository}/issues/comments/{cid}", {"body": base + "\n" + result})
+        state["ledger_updated"] = True
+    except c.HttpError as e:
+        state["ledger_updated"] = False
+        print(f"::warning::予約記録コメントへの結果追記に失敗: HTTP {e.status}")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
@@ -123,6 +143,8 @@ def main(argv=None) -> int:
         else:
             c.gh_send_json("POST", f"/repos/{repository}/issues/{number}/comments", {"body": body})
         state["comment"] = "updated" if cid else "created"
+
+    update_ledger(repository, state)
 
     state["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     c.save_state(out, state)
