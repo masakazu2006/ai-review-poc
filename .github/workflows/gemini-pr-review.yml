@@ -1,0 +1,155 @@
+# =============================================================================
+# Gemini PR 自動レビュー（PoC）  設計書 v0.2.1 ＋ 実装時追加条件（2026-11-18）
+#
+# 【不変条件】変更には main へのPRとユーザーのマージが必要
+#  (1) PR の head / merge コミットを checkout・実行しない。pip install しない。
+#  (2) pull_request_target の branches: [main] と job の if 条件を外さない。
+#  (3) PR由来の文字列（ブランチ名・タイトル・ユーザー名等）は run: に ${{ }} で
+#      直接埋め込まず、必ず env: 経由で渡す。
+#  (4) probe job に Secret・Environment・書き込み権限を与えない。
+#  (5) スクリプトは「起動時のワークフロー定義と同じコミット」(github.workflow_sha)
+#      から取得する。変動する main ブランチ名では取得しない。
+#  (6) Gemini 呼び出しは 1 job 最大1回、予約Artifactによる合計上限（budget.py）を通す。
+# =============================================================================
+name: gemini-pr-review
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "対象PR番号（自動起動しなかった場合の予備）"
+        required: true
+        type: number
+
+permissions: {}
+
+concurrency:
+  group: gemini-review-pr-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    # API・Secretを使わない記録専用 job（初回 actor の確認用）
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Record actor (no secrets, no API)
+        env:
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          SENDER: ${{ github.event.sender.login }}
+          SENDER_TYPE: ${{ github.event.sender.type }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          ALLOWED: ${{ vars.ALLOWED_ACTORS }}
+        run: |
+          {
+            echo "## probe（記録のみ・Gemini呼び出しなし）"
+            echo "| 項目 | 値 |"
+            echo "|---|---|"
+            for k in ACTOR TRIGGERING_ACTOR SENDER SENDER_TYPE PR_AUTHOR HEAD_REPO HEAD_REF HEAD_SHA BASE_SHA WORKFLOW_SHA ALLOWED; do
+              printf '| %s | `%s` |\n' "$k" "${!k}"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          printf '::notice::probe actor=%s triggering_actor=%s sender_type=%s\n' "$ACTOR" "$TRIGGERING_ACTOR" "$SENDER_TYPE"
+
+  review:
+    if: >-
+      github.ref == 'refs/heads/main' && (
+        ( github.event_name == 'workflow_dispatch' &&
+          contains(fromJSON(vars.ALLOWED_ACTORS || '[]'), github.actor) ) ||
+        ( github.event_name == 'pull_request_target' &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          github.event.pull_request.draft == false &&
+          contains(fromJSON(vars.ALLOWED_ACTORS || '[]'), github.actor) &&
+          contains(fromJSON(vars.ALLOWED_ACTORS || '[]'), github.triggering_actor) ) )
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: gemini-review           # APIキーは main からの実行にだけ渡る
+    concurrency:                          # 全PR共通で直列化（呼び出し回数の数え漏れを防ぐ）
+      group: gemini-review-global
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: write
+      actions: read                       # 予約Artifactの件数確認のみ
+    env:                                  # runner コンテキストは job env で使えないため $RUNNER_TEMP を直接参照
+      TRUSTED_SHA: ${{ github.workflow_sha }}
+    steps:
+      - name: Checkout trusted scripts (workflow commit only)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            .github/scripts
+            .github/review-criteria.md
+          sparse-checkout-cone-mode: false
+
+      - name: Verify script source SHA
+        run: |
+          actual="$(git rev-parse HEAD)"
+          if [ "$actual" != "$TRUSTED_SHA" ]; then
+            echo "::error::スクリプト取得元のSHAが一致しません"; exit 1
+          fi
+          echo "::notice::scripts from $TRUSTED_SHA"
+
+      - name: Guard
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+        run: python3 -I .github/scripts/guard.py --out "$RUNNER_TEMP/out"
+
+      - name: Fetch and verify diff
+        id: diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I .github/scripts/fetch_diff.py --out "$RUNNER_TEMP/out" --diff-out "$RUNNER_TEMP/pr.diff" --max-bytes 102400
+
+      - name: Check call budget
+        id: budget
+        if: steps.diff.outputs.status == 'PENDING'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I .github/scripts/budget.py --out "$RUNNER_TEMP/out" --reservation-dir "$RUNNER_TEMP/reservation"
+
+      - name: Reserve one Gemini call
+        id: reserve
+        if: steps.budget.outputs.allowed == 'true'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: ${{ steps.budget.outputs.reservation_name }}
+          path: ${{ runner.temp }}/reservation/reservation.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Gemini review
+        if: steps.reserve.outcome == 'success'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+        run: python3 -I .github/scripts/gemini_review.py --out "$RUNNER_TEMP/out" --diff "$RUNNER_TEMP/pr.diff" --criteria .github/review-criteria.md
+
+      - name: Post comment and finalize record
+        if: always() && steps.pr.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I .github/scripts/post_comment.py --out "$RUNNER_TEMP/out"
+
+      - name: Save history
+        if: always() && steps.pr.outputs.number != ''
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: review-pr${{ steps.pr.outputs.number }}-${{ steps.pr.outputs.head_short }}-run${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/out
+          retention-days: 90
