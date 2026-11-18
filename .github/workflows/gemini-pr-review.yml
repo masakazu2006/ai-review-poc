@@ -133,6 +133,7 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          GEMINI_THINKING_LEVEL: ${{ vars.GEMINI_THINKING_LEVEL }}   # 未設定なら LOW
         run: python3 -I .github/scripts/gemini_review.py --out "$RUNNER_TEMP/out" --diff "$RUNNER_TEMP/pr.diff" --criteria .github/review-criteria.md
 
       - name: Post comment and finalize record

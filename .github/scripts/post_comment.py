@@ -54,6 +54,7 @@ def render(state: dict, result: dict | None, run_url: str) -> str:
         f"+{v.get('additions_diff')}/-{v.get('deletions_diff')}） |",
         f"| スクリプトの取得元SHA | `{state.get('workflow_sha')}` |",
         f"| モデル | `{state.get('model', '-')}` |",
+        f"| 思考レベル | `{state.get('thinking_level', '-')}` |",
         f"| 実行ログ | {run_url} |",
     ]
     if st == c.COMPLETED and result:
@@ -100,6 +101,7 @@ def update_ledger(repository: str, state: dict) -> None:
         return
     u = state.get("usage") or {}
     result = (f"<sub>結果：**{state.get('status')}**　判定 {state.get('verdict', '-')}　"
+              f"思考レベル {state.get('thinking_level', '-')}　"
               f"トークン 入力 {u.get('input', '-')} / 出力 {u.get('output', '-')} / 思考 {u.get('thoughts', '-')}　"
               f"所要 {state.get('duration_sec', '-')} 秒　HTTP {state.get('http_status', '-')}</sub>")
     try:

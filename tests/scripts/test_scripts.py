@@ -405,6 +405,57 @@ class TestGemini(Base):
             if p.is_file():
                 self.assertNotIn(FAKE_KEY, p.read_text(encoding="utf-8"))
 
+    # ---- 思考レベル（PR #5） ----
+    def sent_body(self, fake):
+        return json.loads(fake.calls[0]["data"])
+
+    def ok(self):
+        return gemini_ok_response({"verdict": "OK", "summary": "s", "findings": []})
+
+    def test_thinking_level_low_by_default(self):
+        os.environ.pop("GEMINI_THINKING_LEVEL", None)
+        fake, _ = self.run_gemini(self.ok())
+        gen = self.sent_body(fake)["generationConfig"]
+        self.assertEqual(gen["thinkingConfig"], {"thinkingLevel": "LOW"})
+        self.assertEqual(gen["responseMimeType"], "application/json")   # 既存の設定は維持
+        self.assertIn("responseSchema", gen)
+        self.assertEqual(self.state()["thinking_level"], "LOW")
+
+    def test_thinking_level_empty_variable_means_low(self):
+        os.environ["GEMINI_THINKING_LEVEL"] = "  "
+        fake, _ = self.run_gemini(self.ok())
+        self.assertEqual(self.sent_body(fake)["generationConfig"]["thinkingConfig"]["thinkingLevel"], "LOW")
+
+    def test_thinking_level_medium_for_comparison(self):
+        os.environ["GEMINI_THINKING_LEVEL"] = "medium"            # 小文字も受け付けて正規化
+        fake, _ = self.run_gemini(self.ok())
+        self.assertEqual(self.sent_body(fake)["generationConfig"]["thinkingConfig"]["thinkingLevel"], "MEDIUM")
+        self.assertEqual(self.state()["thinking_level"], "MEDIUM")
+
+    def test_thinking_level_model_default_omits_config(self):
+        os.environ["GEMINI_THINKING_LEVEL"] = "MODEL_DEFAULT"
+        fake, _ = self.run_gemini(self.ok())
+        self.assertNotIn("thinkingConfig", self.sent_body(fake)["generationConfig"])
+        self.assertEqual(self.state()["thinking_level"], "MODEL_DEFAULT")
+
+    def test_thinking_level_invalid_no_request(self):
+        os.environ["GEMINI_THINKING_LEVEL"] = "ULTRA"
+        fake, _ = self.run_gemini(self.ok())
+        st = self.state()
+        self.assertEqual(fake.calls, [])                          # 送信しない
+        self.assertEqual(st["status"], c.API_ERROR)
+        self.assertEqual(st["thinking_level"], "INVALID")
+        self.assertNotIn("gemini_attempted", st)
+
+    def test_thinking_tokens_recorded(self):
+        os.environ.pop("GEMINI_THINKING_LEVEL", None)
+        usage = {"promptTokenCount": 4000, "candidatesTokenCount": 100, "thoughtsTokenCount": 250, "totalTokenCount": 4350}
+        self.run_gemini(gemini_ok_response({"verdict": "OK", "summary": "s", "findings": []}, usage))
+        st = self.state()
+        self.assertEqual(st["usage"]["thoughts"], 250)
+        self.assertEqual(st["thinking_level"], "LOW")
+        self.assertIn("duration_sec", st)
+
     def test_out_dir_from_args_boundaries(self):
         f = gemini_review.out_dir_from_args
         self.assertEqual(f(["--diff", "d", "--out", "o"]), "o")
@@ -555,6 +606,18 @@ class TestPostComment(Base):
         self.assertTrue(body.startswith(budget.LEDGER_MARKER))   # 追記後も予約記録として数えられる
         self.assertIn("COMPLETED", body)
         self.assertTrue(self.state()["ledger_updated"])
+
+    def test_thinking_level_shown_in_comment_and_ledger(self):
+        fake = self.prepare(c.COMPLETED, {"verdict": "OK", "summary": "s", "findings": []})
+        self.with_ledger()
+        st = self.state()
+        st["thinking_level"] = "LOW"
+        c.save_state(self.out, st)
+        self.run_quiet(post_comment.main, ["--out", str(self.out)])
+        post = json.loads([x for x in fake.calls if x["method"] == "POST"][0]["data"])["body"]
+        self.assertIn("| 思考レベル | `LOW` |", post)
+        patch = json.loads([x for x in fake.calls if x["method"] == "PATCH" and x["url"].endswith("/comments/777")][0]["data"])["body"]
+        self.assertIn("思考レベル LOW", patch)
 
     def test_ledger_update_failure_does_not_change_result(self):
         self.prepare(c.COMPLETED, {"verdict": "OK", "summary": "s", "findings": []})
