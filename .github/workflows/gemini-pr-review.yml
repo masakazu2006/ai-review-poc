@@ -10,6 +10,8 @@
 #  (5) スクリプトは「起動時のワークフロー定義と同じコミット」(github.workflow_sha)
 #      から取得する。変動する main ブランチ名では取得しない。
 #  (6) Gemini 呼び出しは 1 job 最大1回、予約Artifactによる合計上限（budget.py）を通す。
+#      PoC実行期間（budget.py の POC_START〜POC_END、89日間）の外では呼び出さない。
+#      予約Artifactの retention-days（90）は、budget.py の RESERVATION_RETENTION_DAYS と一致させる。
 # =============================================================================
 name: gemini-pr-review
 

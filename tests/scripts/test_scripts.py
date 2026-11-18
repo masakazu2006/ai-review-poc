@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parents[2] / ".github" / "scripts"
@@ -206,6 +207,20 @@ class TestFetchDiff(Base):
 
 
 class TestBudget(Base):
+    IN_PERIOD = datetime(2026, 12, 1, 12, 0, tzinfo=timezone.utc)
+
+    def setUp(self):
+        super().setUp()
+        self._orig_now = budget.now_utc
+        self.set_now(self.IN_PERIOD)
+
+    def tearDown(self):
+        budget.now_utc = self._orig_now
+        super().tearDown()
+
+    def set_now(self, dt):
+        budget.now_utc = lambda: dt
+
     def run_budget(self, n_reserved, other=3, exc=None):
         self.guard_ok()
         arts = [{"name": f"gemini-call-x{i}"} for i in range(n_reserved)] + [{"name": f"review-x{i}"} for i in range(other)]
@@ -234,6 +249,49 @@ class TestBudget(Base):
         rd = self.run_budget(0, exc=c.HttpError(500))
         self.assertEqual(self.state()["status"], c.BUDGET_CHECK_FAILED)
         self.assertFalse((rd / "reservation.json").exists())
+
+    # ---- PoC実行期間の制限 ----
+    def run_at(self, dt):
+        self.set_now(dt)
+        rd = self.run_budget(0)
+        artifact_calls = [x for x in c.http_request.calls if "/actions/artifacts" in x["url"]]
+        return rd, artifact_calls
+
+    def test_after_end_denied_without_api_call(self):
+        rd, calls = self.run_at(budget.POC_END)                      # 期限ちょうど＝期間外
+        self.assertEqual(self.state()["status"], c.OUTSIDE_POC_PERIOD)
+        self.assertFalse((rd / "reservation.json").exists())
+        self.assertEqual(calls, [])                                  # 件数確認にも進まない
+
+    def test_long_after_end_denied(self):
+        rd, _ = self.run_at(budget.POC_END + timedelta(days=200))
+        self.assertEqual(self.state()["status"], c.OUTSIDE_POC_PERIOD)
+        self.assertFalse((rd / "reservation.json").exists())
+
+    def test_before_start_denied(self):
+        rd, calls = self.run_at(budget.POC_START - timedelta(seconds=1))
+        self.assertEqual(self.state()["status"], c.OUTSIDE_POC_PERIOD)
+        self.assertEqual(calls, [])
+
+    def test_last_moment_in_period_allowed(self):
+        rd, _ = self.run_at(budget.POC_END - timedelta(seconds=1))
+        self.assertTrue((rd / "reservation.json").exists())
+        self.assertIn("poc_period", self.state())
+
+    def test_first_moment_in_period_allowed(self):
+        rd, _ = self.run_at(budget.POC_START)
+        self.assertTrue((rd / "reservation.json").exists())
+
+    def test_period_shorter_than_retention(self):
+        # 期間内に作った予約は、期間内のどの時点でも保存期間（90日）未満で、期限切れにならない
+        self.assertLess(budget.POC_END - budget.POC_START, timedelta(days=budget.RESERVATION_RETENTION_DAYS))
+        self.assertEqual(budget.POC_START, datetime(2026, 11, 18, tzinfo=timezone.utc))
+        self.assertEqual(budget.POC_END, datetime(2027, 2, 15, tzinfo=timezone.utc))
+
+    def test_workflow_retention_matches(self):
+        wf = (SCRIPTS.parent / "workflows" / "gemini-pr-review.yml").read_text(encoding="utf-8")
+        block = wf.split("name: Reserve one Gemini call", 1)[1].split("- name:", 1)[0]
+        self.assertIn(f"retention-days: {budget.RESERVATION_RETENTION_DAYS}", block)
 
 
 def gemini_ok_response(result, usage=None):
