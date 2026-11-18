@@ -99,7 +99,9 @@ def main(argv=None) -> int:
     repository = c.repo()
     number = state["pr_number"]
     if state.get("status") == c.PENDING:   # 呼び出し前に止まった（予算確認の失敗など）
-        state.update(status=c.API_ERROR, reasons=state.get("reasons") or ["Gemini呼び出しが実行されなかった"])
+        state.update(status=c.API_ERROR, reasons=state.get("reasons") or (
+            ["Gemini呼び出しの結果が記録されなかった"] if state.get("gemini_attempted")
+            else ["Gemini呼び出しに到達しなかった"]))
 
     run_url = f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{repository}/actions/runs/{state.get('run_id')}"
     rp = out / "result.json"
