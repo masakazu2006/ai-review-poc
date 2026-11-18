@@ -59,7 +59,15 @@ def http_request(method: str, url: str, headers: dict | None = None,
             pass
         raise HttpError(e.code, str(e.reason), body) from None
     except urllib.error.URLError as e:
+        if isinstance(e.reason, TimeoutError):
+            raise HttpError(0, f"timeout ({timeout}s)") from None
         raise HttpError(0, f"network error: {type(e.reason).__name__}") from None
+    except TimeoutError:
+        # 応答待ちのタイムアウト（socket.timeout は TimeoutError の別名）
+        raise HttpError(0, f"timeout ({timeout}s)") from None
+    except OSError as e:
+        # 接続断など。メッセージには例外の型名のみを含める
+        raise HttpError(0, f"network error: {type(e).__name__}") from None
 
 
 def gh_headers(accept: str = "application/vnd.github+json") -> dict:

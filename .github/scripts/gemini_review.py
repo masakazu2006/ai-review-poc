@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import common as c  # noqa: E402
 
 ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+TIMEOUT_SEC = 180   # 応答待ちの上限（job の timeout-minutes 内に収まること）
 
 # 有料枠の単価（USD / 1Mトークン）。2026-11-18 に料金ページで確認。試算にのみ使用。
 PRICES = {
@@ -104,7 +105,7 @@ def build_body(criteria: str, diff: str) -> dict:
     }
 
 
-def main(argv=None) -> int:
+def run(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     ap.add_argument("--diff", required=True)
@@ -123,24 +124,35 @@ def main(argv=None) -> int:
     body = build_body(Path(a.criteria).read_text(encoding="utf-8"),
                       Path(a.diff).read_text(encoding="utf-8"))
     headers = {"Content-Type": "application/json", "x-goog-api-key": key}
+    # 呼び出しを試みた事実を、送信前に記録しておく（途中で失敗しても残る）
+    state["gemini_attempted"] = True
+    state["gemini_timeout_sec"] = TIMEOUT_SEC
+    state["attempted_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    state["reasons"] = ["Gemini呼び出しの結果が記録される前に処理が終了した"]
+    c.save_state(a.out, state)
     t0 = time.time()
     try:
         _, _, raw = c.http_request("POST", ENDPOINT.format(model=model), headers,
-                                   json.dumps(body).encode("utf-8"), timeout=180)
+                                   json.dumps(body).encode("utf-8"), timeout=TIMEOUT_SEC)
         state["http_status"] = 200
     except c.HttpError as e:
         state["http_status"] = e.status
-        err_kind = ""
-        try:
-            err_kind = json.loads(e.body.decode("utf-8")).get("error", {}).get("status", "")
-        except Exception:
-            pass
-        state.update(status=c.RATE_LIMITED if e.status == 429 else c.API_ERROR,
-                     reasons=[f"Gemini API: HTTP {e.status} {err_kind}".strip()])
+        if e.status == 0:   # タイムアウト・接続断（HTTP応答なし）
+            reason = (f"Gemini API: 応答待ちタイムアウト（{TIMEOUT_SEC}秒）" if e.reason.startswith("timeout")
+                      else f"Gemini API: 通信エラー（{e.reason}）")
+        else:
+            err_kind = ""
+            try:
+                err_kind = json.loads(e.body.decode("utf-8")).get("error", {}).get("status", "")
+            except Exception:
+                pass
+            reason = f"Gemini API: HTTP {e.status} {err_kind}".strip()
+        state.update(status=c.RATE_LIMITED if e.status == 429 else c.API_ERROR, reasons=[reason])
         state["duration_sec"] = round(time.time() - t0, 1)
         c.save_state(a.out, state)
         return 0
     state["duration_sec"] = round(time.time() - t0, 1)
+    state.pop("reasons", None)
 
     try:
         resp = json.loads(raw.decode("utf-8"))
@@ -179,6 +191,41 @@ def main(argv=None) -> int:
     c.save_state(a.out, state)
     c.notice(f"Gemini {state['status']} tokens in={prompt_t} out={cand_t} thoughts={thought_t}")
     return 0
+
+
+def out_dir_from_args(args: list[str]) -> str | None:
+    """例外ハンドラ用に --out の値を安全に取り出す（値がない・不正なら None）。
+
+    `--out PATH` と `--out=PATH` の両形式に対応する。境界外参照や
+    次のオプションを値と誤認することがないようにする（Geminiレビュー指摘への対応）。
+    """
+    for i, a in enumerate(args):
+        if a.startswith("--out="):
+            v = a[len("--out="):]
+            return v or None
+        if a == "--out":
+            if i + 1 < len(args) and args[i + 1] and not args[i + 1].startswith("-"):
+                return args[i + 1]
+            return None
+    return None
+
+
+def main(argv=None) -> int:
+    """予期しない例外でも状態を API_ERROR として残す（メッセージは型名のみ。キーを含めない）。"""
+    try:
+        return run(argv)
+    except Exception as e:  # noqa: BLE001
+        args = list(argv) if argv is not None else sys.argv[1:]
+        out = out_dir_from_args(args)
+        if out:
+            try:
+                state = c.load_state(out)
+                state.update(status=c.API_ERROR, reasons=[f"予期しない例外: {type(e).__name__}"])
+                c.save_state(out, state)
+            except Exception as e2:  # noqa: BLE001  記録に失敗しても異常終了しない
+                print(f"::error::gemini_review: 状態の保存に失敗 {type(e2).__name__}")
+        print(f"::error::gemini_review: 予期しない例外 {type(e).__name__}")
+        return 0
 
 
 if __name__ == "__main__":

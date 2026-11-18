@@ -337,12 +337,114 @@ class TestGemini(Base):
         self.run_gemini(gemini_ok_response({"verdict": "たぶんOK", "summary": "s", "findings": []}))
         self.assertEqual(self.state()["status"], c.INVALID_OUTPUT)
 
+    def test_timeout_recorded_accurately(self):
+        # 2026-11-18 スモークテストで発生した事象（応答待ちタイムアウト）の再現
+        fake, stdout = self.run_gemini(c.HttpError(0, "timeout (180s)"))
+        st = self.state()
+        self.assertEqual(st["status"], c.API_ERROR)
+        self.assertIn("タイムアウト（180秒）", st["reasons"][0])
+        self.assertEqual(st["model"], "gemini-3.8-flash")
+        self.assertTrue(st["gemini_attempted"])
+        self.assertEqual(len(fake.calls), 1)               # 再試行しない
+        self.assertNotIn(FAKE_KEY, stdout)
+
+    def test_network_error_recorded(self):
+        self.run_gemini(c.HttpError(0, "network error: ConnectionResetError"))
+        st = self.state()
+        self.assertEqual(st["status"], c.API_ERROR)
+        self.assertIn("通信エラー", st["reasons"][0])
+
+    def test_unexpected_exception_recorded_without_key(self):
+        def boom(u, h, d):
+            raise RuntimeError(f"secret in message {FAKE_KEY}")
+        _, stdout = self.run_gemini(boom)
+        st = self.state()
+        self.assertEqual(st["status"], c.API_ERROR)
+        self.assertEqual(st["reasons"], ["予期しない例外: RuntimeError"])
+        self.assertTrue(st["gemini_attempted"])
+        self.assertNotIn(FAKE_KEY, stdout)
+        for p in self.out.rglob("*"):
+            if p.is_file():
+                self.assertNotIn(FAKE_KEY, p.read_text(encoding="utf-8"))
+
+    def test_out_dir_from_args_boundaries(self):
+        f = gemini_review.out_dir_from_args
+        self.assertEqual(f(["--diff", "d", "--out", "o"]), "o")
+        self.assertEqual(f(["--out=o", "--diff", "d"]), "o")
+        self.assertIsNone(f(["--diff", "d", "--out"]))          # 末尾で値なし（指摘のケース）
+        self.assertIsNone(f(["--out", "--diff", "d"]))          # 次のオプションを値と誤認しない
+        self.assertIsNone(f(["--out="]))
+        self.assertIsNone(f(["--out", ""]))
+        self.assertIsNone(f([]))
+
+    def test_exception_handler_with_missing_out_value(self):
+        # run() が例外を出し、かつ --out が末尾で値なしでも、ハンドラ自体は異常終了しない
+        orig = gemini_review.run
+
+        def boom(argv=None):
+            raise RuntimeError("x")
+        gemini_review.run = boom
+        try:
+            rc, out = self.run_quiet(gemini_review.main, ["--diff", "d", "--out"])
+        finally:
+            gemini_review.run = orig
+        self.assertEqual(rc, 0)
+        self.assertIn("予期しない例外 RuntimeError", out)
+
+    def test_exception_handler_survives_unwritable_out(self):
+        orig = gemini_review.run
+
+        def boom(argv=None):
+            raise RuntimeError("x")
+        gemini_review.run = boom
+        blocker = Path(self.tmp.name) / "file_not_dir"
+        blocker.write_text("x", encoding="utf-8")
+        try:
+            rc, out = self.run_quiet(gemini_review.main, ["--out", str(blocker / "sub")])
+        finally:
+            gemini_review.run = orig
+        self.assertEqual(rc, 0)
+        self.assertIn("状態の保存に失敗", out)
+
+    def test_success_clears_placeholder_reason(self):
+        self.run_gemini(gemini_ok_response({"verdict": "OK", "summary": "s", "findings": []}))
+        self.assertNotIn("reasons", self.state())
+
     def test_key_not_written_anywhere(self):
         _, stdout = self.run_gemini(c.HttpError(400, "Bad Request", b'{"error":{"status":"INVALID_ARGUMENT"}}'))
         self.assertNotIn(FAKE_KEY, stdout)
         for p in self.out.rglob("*"):
             if p.is_file():
                 self.assertNotIn(FAKE_KEY, p.read_text(encoding="utf-8"))
+
+
+class TestHttpTimeoutMapping(unittest.TestCase):
+    """common.http_request が実際のソケットのタイムアウトを HttpError(0, 'timeout') に変換すること。"""
+
+    def test_read_timeout(self):
+        import socket
+        import threading
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        conns = []
+
+        def accept():
+            conn, _ = srv.accept()   # 受け付けるが応答しない
+            conns.append(conn)
+        th = threading.Thread(target=accept, daemon=True)
+        th.start()
+        try:
+            with self.assertRaises(c.HttpError) as cm:
+                self._orig = c.http_request
+                c.http_request("POST", f"http://127.0.0.1:{port}/", {}, b"{}", timeout=1)
+            self.assertEqual(cm.exception.status, 0)
+            self.assertTrue(cm.exception.reason.startswith("timeout"))
+        finally:
+            for x in conns:
+                x.close()
+            srv.close()
 
 
 class TestPostComment(Base):
