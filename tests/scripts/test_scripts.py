@@ -367,6 +367,45 @@ class TestGemini(Base):
             if p.is_file():
                 self.assertNotIn(FAKE_KEY, p.read_text(encoding="utf-8"))
 
+    def test_out_dir_from_args_boundaries(self):
+        f = gemini_review.out_dir_from_args
+        self.assertEqual(f(["--diff", "d", "--out", "o"]), "o")
+        self.assertEqual(f(["--out=o", "--diff", "d"]), "o")
+        self.assertIsNone(f(["--diff", "d", "--out"]))          # 末尾で値なし（指摘のケース）
+        self.assertIsNone(f(["--out", "--diff", "d"]))          # 次のオプションを値と誤認しない
+        self.assertIsNone(f(["--out="]))
+        self.assertIsNone(f(["--out", ""]))
+        self.assertIsNone(f([]))
+
+    def test_exception_handler_with_missing_out_value(self):
+        # run() が例外を出し、かつ --out が末尾で値なしでも、ハンドラ自体は異常終了しない
+        orig = gemini_review.run
+
+        def boom(argv=None):
+            raise RuntimeError("x")
+        gemini_review.run = boom
+        try:
+            rc, out = self.run_quiet(gemini_review.main, ["--diff", "d", "--out"])
+        finally:
+            gemini_review.run = orig
+        self.assertEqual(rc, 0)
+        self.assertIn("予期しない例外 RuntimeError", out)
+
+    def test_exception_handler_survives_unwritable_out(self):
+        orig = gemini_review.run
+
+        def boom(argv=None):
+            raise RuntimeError("x")
+        gemini_review.run = boom
+        blocker = Path(self.tmp.name) / "file_not_dir"
+        blocker.write_text("x", encoding="utf-8")
+        try:
+            rc, out = self.run_quiet(gemini_review.main, ["--out", str(blocker / "sub")])
+        finally:
+            gemini_review.run = orig
+        self.assertEqual(rc, 0)
+        self.assertIn("状態の保存に失敗", out)
+
     def test_success_clears_placeholder_reason(self):
         self.run_gemini(gemini_ok_response({"verdict": "OK", "summary": "s", "findings": []}))
         self.assertNotIn("reasons", self.state())

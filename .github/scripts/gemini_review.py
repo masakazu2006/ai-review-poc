@@ -193,19 +193,37 @@ def run(argv=None) -> int:
     return 0
 
 
+def out_dir_from_args(args: list[str]) -> str | None:
+    """例外ハンドラ用に --out の値を安全に取り出す（値がない・不正なら None）。
+
+    `--out PATH` と `--out=PATH` の両形式に対応する。境界外参照や
+    次のオプションを値と誤認することがないようにする（Geminiレビュー指摘への対応）。
+    """
+    for i, a in enumerate(args):
+        if a.startswith("--out="):
+            v = a[len("--out="):]
+            return v or None
+        if a == "--out":
+            if i + 1 < len(args) and args[i + 1] and not args[i + 1].startswith("-"):
+                return args[i + 1]
+            return None
+    return None
+
+
 def main(argv=None) -> int:
     """予期しない例外でも状態を API_ERROR として残す（メッセージは型名のみ。キーを含めない）。"""
     try:
         return run(argv)
     except Exception as e:  # noqa: BLE001
-        out = None
         args = list(argv) if argv is not None else sys.argv[1:]
-        if "--out" in args:
-            out = args[args.index("--out") + 1]
+        out = out_dir_from_args(args)
         if out:
-            state = c.load_state(out)
-            state.update(status=c.API_ERROR, reasons=[f"予期しない例外: {type(e).__name__}"])
-            c.save_state(out, state)
+            try:
+                state = c.load_state(out)
+                state.update(status=c.API_ERROR, reasons=[f"予期しない例外: {type(e).__name__}"])
+                c.save_state(out, state)
+            except Exception as e2:  # noqa: BLE001  記録に失敗しても異常終了しない
+                print(f"::error::gemini_review: 状態の保存に失敗 {type(e2).__name__}")
         print(f"::error::gemini_review: 予期しない例外 {type(e).__name__}")
         return 0
 
