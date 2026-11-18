@@ -207,92 +207,130 @@ class TestFetchDiff(Base):
 
 
 class TestBudget(Base):
+    """予約記録コメント方式の呼び出し回数管理。"""
     IN_PERIOD = datetime(2026, 12, 1, 12, 0, tzinfo=timezone.utc)
+    BOT = "github-actions[bot]"
 
     def setUp(self):
         super().setUp()
         self._orig_now = budget.now_utc
-        self.set_now(self.IN_PERIOD)
+        budget.now_utc = lambda: self.IN_PERIOD
 
     def tearDown(self):
         budget.now_utc = self._orig_now
         super().tearDown()
 
-    def set_now(self, dt):
-        budget.now_utc = lambda: dt
+    def ledger(self, n, user=None):
+        return [{"id": 1000 + i, "user": {"login": user or self.BOT},
+                 "body": budget.LEDGER_MARKER + f"\n予約 {i}"} for i in range(n)]
 
-    def run_budget(self, n_reserved, other=3, exc=None):
+    def run_budget(self, comments, list_exc=None, post_resp=None, post_exc=None, now=None):
         self.guard_ok()
-        arts = [{"name": f"gemini-call-x{i}"} for i in range(n_reserved)] + [{"name": f"review-x{i}"} for i in range(other)]
+        if now:
+            budget.now_utc = lambda: now
 
-        def pages(u, h, d):
-            if exc:
-                return exc
-            page = int(u.split("page=")[-1])
-            return {"artifacts": arts[(page - 1) * 100: page * 100]}
-        self.use([(("GET", "/actions/artifacts"), pages)])
-        rd = Path(self.tmp.name) / "res"
-        self.run_quiet(budget.main, ["--out", str(self.out), "--reservation-dir", str(rd)])
-        return rd
+        def listing(u, h, d):
+            if list_exc:
+                return list_exc
+            from urllib.parse import parse_qs, urlparse
+            page = int(parse_qs(urlparse(u).query)["page"][0])
+            return comments[(page - 1) * 100: page * 100]
 
-    def test_under_limit_reserves(self):
-        rd = self.run_budget(69, other=120)   # ページ送りも確認
-        self.assertEqual(self.state()["budget"]["used_before"], 69)
-        self.assertTrue((rd / "reservation.json").exists())
+        def post(u, h, d):
+            if post_exc:
+                return post_exc
+            return post_resp if post_resp is not None else {"id": 777}
+        fake = self.use([
+            (("GET", "/issues/comments?"), listing),
+            (("POST", "/issues/5/comments"), post),
+        ])
+        rc, out = self.run_quiet(budget.main, ["--out", str(self.out)])
+        return fake, rc, out
 
-    def test_limit_reached(self):
-        rd = self.run_budget(70)
+    def posts(self, fake):
+        return [x for x in fake.calls if x["method"] == "POST"]
+
+    def test_baseline_carried_over(self):
+        # 導入前の実績4回を引き継ぎ、最初の予約は 5/70 になる
+        self.assertEqual(budget.LEDGER_BASELINE, 4)
+        fake, _, _ = self.run_budget([])
+        st = self.state()
+        self.assertEqual(st["budget"]["used_before"], 4)
+        self.assertEqual(st["budget"]["sequence"], 5)
+        body = json.loads(self.posts(fake)[0]["data"])["body"]
+        self.assertTrue(body.startswith(budget.LEDGER_MARKER))
+        self.assertIn("5/70", body)
+        self.assertIn("attempt `1`", body)
+        self.assertEqual(st["ledger_comment_id"], 777)
+
+    def test_counts_across_pages_and_ignores_others(self):
+        noise = [{"id": 1, "user": {"login": "masakazu2006"}, "body": "普通のコメント"}] * 150
+        fake, _, _ = self.run_budget(self.ledger(60) + noise)   # 2ページ目にまたがる
+        self.assertEqual(self.state()["budget"]["used_before"], 64)
+        self.assertEqual(len(self.posts(fake)), 1)
+
+    def test_limit_reached_no_post(self):
+        fake, _, _ = self.run_budget(self.ledger(66))          # 4 + 66 = 70
         self.assertEqual(self.state()["status"], c.BUDGET_EXHAUSTED)
-        self.assertFalse((rd / "reservation.json").exists())
+        self.assertEqual(self.posts(fake), [])
 
-    def test_fail_closed(self):
-        rd = self.run_budget(0, exc=c.HttpError(500))
+    def test_last_call_allowed(self):
+        self.run_budget(self.ledger(65))                        # 4 + 65 = 69 → 70回目は許可
+        self.assertEqual(self.state()["budget"]["sequence"], 70)
+
+    def test_marker_by_non_bot_not_counted(self):
+        # bot以外が目印付きコメントを書いても件数は増減しない
+        fake, _, _ = self.run_budget(self.ledger(5, user="masakazu2006") + self.ledger(2))
+        self.assertEqual(self.state()["budget"]["used_before"], 6)
+
+    def test_marker_not_at_start_not_counted(self):
+        quoted = [{"id": 9, "user": {"login": self.BOT}, "body": "引用: " + budget.LEDGER_MARKER}]
+        self.run_budget(quoted)
+        self.assertEqual(self.state()["budget"]["used_before"], 4)
+
+    def test_rerun_is_counted(self):
+        # 再実行（attempt 2）でも、前の試行の予約記録コメントは残り、数えられる
+        os.environ["GITHUB_RUN_ATTEMPT"] = "2"
+        prev = self.ledger(1)
+        fake, _, _ = self.run_budget(prev)
+        self.assertEqual(self.state()["budget"]["sequence"], 6)
+        self.assertIn("attempt `2`", json.loads(self.posts(fake)[0]["data"])["body"])
+
+    def test_list_failure_fail_closed(self):
+        fake, _, _ = self.run_budget([], list_exc=c.HttpError(500))
         self.assertEqual(self.state()["status"], c.BUDGET_CHECK_FAILED)
-        self.assertFalse((rd / "reservation.json").exists())
+        self.assertEqual(self.posts(fake), [])
 
-    # ---- PoC実行期間の制限 ----
-    def run_at(self, dt):
-        self.set_now(dt)
-        rd = self.run_budget(0)
-        artifact_calls = [x for x in c.http_request.calls if "/actions/artifacts" in x["url"]]
-        return rd, artifact_calls
+    def test_post_failure_fail_closed(self):
+        self.run_budget([], post_exc=c.HttpError(403))
+        st = self.state()
+        self.assertEqual(st["status"], c.BUDGET_CHECK_FAILED)
+        self.assertNotIn("ledger_comment_id", st)
+
+    def test_post_without_id_fail_closed(self):
+        self.run_budget([], post_resp={})
+        self.assertEqual(self.state()["status"], c.BUDGET_CHECK_FAILED)
 
     def test_after_end_denied_without_api_call(self):
-        rd, calls = self.run_at(budget.POC_END)                      # 期限ちょうど＝期間外
+        fake, _, _ = self.run_budget([], now=budget.POC_END)
         self.assertEqual(self.state()["status"], c.OUTSIDE_POC_PERIOD)
-        self.assertFalse((rd / "reservation.json").exists())
-        self.assertEqual(calls, [])                                  # 件数確認にも進まない
-
-    def test_long_after_end_denied(self):
-        rd, _ = self.run_at(budget.POC_END + timedelta(days=200))
-        self.assertEqual(self.state()["status"], c.OUTSIDE_POC_PERIOD)
-        self.assertFalse((rd / "reservation.json").exists())
+        self.assertEqual(fake.calls, [])
 
     def test_before_start_denied(self):
-        rd, calls = self.run_at(budget.POC_START - timedelta(seconds=1))
+        fake, _, _ = self.run_budget([], now=budget.POC_START - timedelta(seconds=1))
         self.assertEqual(self.state()["status"], c.OUTSIDE_POC_PERIOD)
-        self.assertEqual(calls, [])
+        self.assertEqual(fake.calls, [])
 
-    def test_last_moment_in_period_allowed(self):
-        rd, _ = self.run_at(budget.POC_END - timedelta(seconds=1))
-        self.assertTrue((rd / "reservation.json").exists())
-        self.assertIn("poc_period", self.state())
+    def test_period_edges_allowed(self):
+        self.run_budget([], now=budget.POC_START)
+        self.assertEqual(self.state()["budget"]["sequence"], 5)
 
-    def test_first_moment_in_period_allowed(self):
-        rd, _ = self.run_at(budget.POC_START)
-        self.assertTrue((rd / "reservation.json").exists())
-
-    def test_period_shorter_than_retention(self):
-        # 期間内に作った予約は、期間内のどの時点でも保存期間（90日）未満で、期限切れにならない
-        self.assertLess(budget.POC_END - budget.POC_START, timedelta(days=budget.RESERVATION_RETENTION_DAYS))
-        self.assertEqual(budget.POC_START, datetime(2026, 11, 18, tzinfo=timezone.utc))
-        self.assertEqual(budget.POC_END, datetime(2027, 2, 15, tzinfo=timezone.utc))
-
-    def test_workflow_retention_matches(self):
+    def test_workflow_uses_ledger_without_extra_permissions(self):
         wf = (SCRIPTS.parent / "workflows" / "gemini-pr-review.yml").read_text(encoding="utf-8")
-        block = wf.split("name: Reserve one Gemini call", 1)[1].split("- name:", 1)[0]
-        self.assertIn(f"retention-days: {budget.RESERVATION_RETENTION_DAYS}", block)
-
+        self.assertNotIn("Reserve one Gemini call", wf)
+        self.assertNotIn("actions: read", wf)
+        self.assertNotIn("issues: write", wf)
+        self.assertIn("if: steps.budget.outputs.allowed == 'true'", wf)
 
 def gemini_ok_response(result, usage=None):
     return {"candidates": [{"content": {"parts": [{"text": json.dumps(result, ensure_ascii=False)}]}, "finishReason": "STOP"}],
@@ -498,6 +536,43 @@ class TestPostComment(Base):
         body = json.loads([x for x in fake.calls if x["method"] == "POST"][0]["data"])["body"]
         self.assertIn("レビュー未完了", body)
         self.assertNotIn("判定：", body)
+
+    def with_ledger(self):
+        st = self.state()
+        st["ledger_comment_id"] = 777
+        st["ledger_body"] = budget.LEDGER_MARKER + "\n予約 5/70"
+        st["usage"] = {"input": 10, "output": 2, "thoughts": 3}
+        c.save_state(self.out, st)
+
+    def test_ledger_updated_with_result(self):
+        fake = self.prepare(c.COMPLETED, {"verdict": "OK", "summary": "s", "findings": []})
+        self.with_ledger()
+        rc, _ = self.run_quiet(post_comment.main, ["--out", str(self.out)])
+        self.assertEqual(rc, 0)
+        patch = [x for x in fake.calls if x["method"] == "PATCH" and x["url"].endswith("/comments/777")]
+        self.assertEqual(len(patch), 1)
+        body = json.loads(patch[0]["data"])["body"]
+        self.assertTrue(body.startswith(budget.LEDGER_MARKER))   # 追記後も予約記録として数えられる
+        self.assertIn("COMPLETED", body)
+        self.assertTrue(self.state()["ledger_updated"])
+
+    def test_ledger_update_failure_does_not_change_result(self):
+        self.prepare(c.COMPLETED, {"verdict": "OK", "summary": "s", "findings": []})
+        self.with_ledger()
+
+        def fail_patch(u, h, d):
+            return c.HttpError(500) if u.endswith("/comments/777") else {"id": 1}
+        c.http_request.routes.insert(0, (("PATCH", "/issues/comments/777"), fail_patch))
+        rc, out = self.run_quiet(post_comment.main, ["--out", str(self.out)])
+        self.assertEqual(rc, 0)
+        self.assertFalse(self.state()["ledger_updated"])
+        self.assertIn("結果追記に失敗", out)
+
+    def test_ledger_comment_not_mistaken_for_review_comment(self):
+        existing = [{"id": 777, "user": {"login": "github-actions[bot]"}, "body": budget.LEDGER_MARKER + "\n予約"}]
+        fake = self.prepare(c.COMPLETED, {"verdict": "OK", "summary": "s", "findings": []}, existing=existing)
+        self.run_quiet(post_comment.main, ["--out", str(self.out)])
+        self.assertTrue(any(x["method"] == "POST" for x in fake.calls))   # 予約記録を上書きしない
 
     def test_superseded_skips_post(self):
         fake = self.prepare(c.COMPLETED, {"verdict": "OK", "summary": "s", "findings": []}, head_after="n" * 40)

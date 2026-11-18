@@ -9,9 +9,11 @@
 #  (4) probe job に Secret・Environment・書き込み権限を与えない。
 #  (5) スクリプトは「起動時のワークフロー定義と同じコミット」(github.workflow_sha)
 #      から取得する。変動する main ブランチ名では取得しない。
-#  (6) Gemini 呼び出しは 1 job 最大1回、予約Artifactによる合計上限（budget.py）を通す。
-#      PoC実行期間（budget.py の POC_START〜POC_END、89日間）の外では呼び出さない。
-#      予約Artifactの retention-days（90）は、budget.py の RESERVATION_RETENTION_DAYS と一致させる。
+#  (6) Gemini 呼び出しは 1 job 最大1回。呼び出し前に PR へ「予約記録コメント」を投稿し、
+#      リポジトリ全体の予約記録コメント（github-actions[bot] のもの）＋導入前の実績で
+#      合計上限（budget.py の CALL_LIMIT）を判定する。再実行でも記録は消えない。
+#      PoC実行期間（budget.py の POC_START〜POC_END）の外では呼び出さない。
+#      予約記録コメントは削除しないこと。
 # =============================================================================
 name: gemini-pr-review
 
@@ -82,8 +84,7 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: read
-      pull-requests: write
-      actions: read                       # 予約Artifactの件数確認のみ
+      pull-requests: write                # PRコメント（レビュー結果・予約記録）
     env:                                  # runner コンテキストは job env で使えないため $RUNNER_TEMP を直接参照
       TRUSTED_SHA: ${{ github.workflow_sha }}
     steps:
@@ -118,25 +119,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python3 -I .github/scripts/fetch_diff.py --out "$RUNNER_TEMP/out" --diff-out "$RUNNER_TEMP/pr.diff" --max-bytes 102400
 
-      - name: Check call budget
+      - name: Check call budget and record reservation
         id: budget
         if: steps.diff.outputs.status == 'PENDING'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 -I .github/scripts/budget.py --out "$RUNNER_TEMP/out" --reservation-dir "$RUNNER_TEMP/reservation"
-
-      - name: Reserve one Gemini call
-        id: reserve
-        if: steps.budget.outputs.allowed == 'true'
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: ${{ steps.budget.outputs.reservation_name }}
-          path: ${{ runner.temp }}/reservation/reservation.json
-          if-no-files-found: error
-          retention-days: 90
+        run: python3 -I .github/scripts/budget.py --out "$RUNNER_TEMP/out"
 
       - name: Gemini review
-        if: steps.reserve.outcome == 'success'
+        if: steps.budget.outputs.allowed == 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
