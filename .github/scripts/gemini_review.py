@@ -20,6 +20,25 @@ import common as c  # noqa: E402
 ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 TIMEOUT_SEC = 180   # 応答待ちの上限（job の timeout-minutes 内に収まること）
 
+# 思考レベル（Gemini API の generationConfig.thinkingConfig.thinkingLevel）
+# 公式仕様（ai.google.dev/api/generate-content の ThinkingConfig）に基づく列挙値。
+# 2026-11-18 のスモークテストで既定値（指定なし）の思考トークンが最大 8,779、応答 92 秒〜180秒超と
+# 長かったため、PoC の既定は LOW とする。比較用に Repository variable GEMINI_THINKING_LEVEL で
+# MEDIUM / HIGH、または MODEL_DEFAULT（指定を送らずモデルの既定値に任せる）に切り替えられる。
+THINKING_LEVELS = ("LOW", "MEDIUM", "HIGH")
+MODEL_DEFAULT = "MODEL_DEFAULT"
+DEFAULT_THINKING_LEVEL = "LOW"
+
+
+def resolve_thinking_level(raw: str | None) -> str | None:
+    """変数の値を正規化する。不正な値なら None。空なら既定（LOW）。"""
+    v = (raw or "").strip().upper()
+    if not v:
+        return DEFAULT_THINKING_LEVEL
+    if v in THINKING_LEVELS or v == MODEL_DEFAULT:
+        return v
+    return None
+
 # 有料枠の単価（USD / 1Mトークン）。2026-11-18 に料金ページで確認。試算にのみ使用。
 PRICES = {
     "gemini-3.8-flash": [("2026-12-31", 0.75, 3.75), ("9999-12-31", 1.50, 7.50)],
@@ -96,12 +115,15 @@ def validate(obj) -> list[str]:
     return errs
 
 
-def build_body(criteria: str, diff: str) -> dict:
+def build_body(criteria: str, diff: str, thinking_level: str = DEFAULT_THINKING_LEVEL) -> dict:
     user = f"## レビュー基準\n{criteria}\n\n## レビュー対象の差分\n<diff>\n{diff}\n</diff>"
+    gen = {"responseMimeType": "application/json", "responseSchema": SCHEMA}
+    if thinking_level != MODEL_DEFAULT:
+        gen["thinkingConfig"] = {"thinkingLevel": thinking_level}
     return {
         "systemInstruction": {"parts": [{"text": SYSTEM}]},
         "contents": [{"role": "user", "parts": [{"text": user}]}],
-        "generationConfig": {"responseMimeType": "application/json", "responseSchema": SCHEMA},
+        "generationConfig": gen,
     }
 
 
@@ -121,8 +143,17 @@ def run(argv=None) -> int:
         c.save_state(a.out, state)
         return 0
 
+    raw_level = os.environ.get("GEMINI_THINKING_LEVEL", "")
+    level = resolve_thinking_level(raw_level)
+    if level is None:
+        # 不正な設定値では送信しない（予約済みの1回は消費扱いのまま＝多めに数える側）
+        state.update(status=c.API_ERROR, thinking_level="INVALID",
+                     reasons=["GEMINI_THINKING_LEVEL が不正（LOW / MEDIUM / HIGH / MODEL_DEFAULT のいずれか）"])
+        c.save_state(a.out, state)
+        return 0
+    state["thinking_level"] = level
     body = build_body(Path(a.criteria).read_text(encoding="utf-8"),
-                      Path(a.diff).read_text(encoding="utf-8"))
+                      Path(a.diff).read_text(encoding="utf-8"), level)
     headers = {"Content-Type": "application/json", "x-goog-api-key": key}
     # 呼び出しを試みた事実を、送信前に記録しておく（途中で失敗しても残る）
     state["gemini_attempted"] = True
